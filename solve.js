@@ -308,30 +308,30 @@ function isEscapable(c) {
   );
 }
 
+/** Whether the character at `j` in `s` is backslash-escaped: an odd run of backslashes stands right before it. Backslashes pair up left to right (each escapes the next, `\` being escapable), so a run of even length escapes nothing and a run of odd length leaves its last backslash to escape `s[j]` — which is escapable at every call site here. */
+function isEscapedAt(s, j) {
+  let n = 0;
+  for (let k = j - 1; k >= 0 && s.charCodeAt(k) === 92; k--) n++;
+  return n % 2 === 1;
+}
+
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
-  const last = s.length - what.length;
-  for (let j = from; j <= last; j++) {
-    if (s.charCodeAt(j) === 92 && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
-  }
-  return -1;
+  let j = s.indexOf(what, from);
+  while (j !== -1 && isEscapedAt(s, j)) j = s.indexOf(what, j + 1);
+  return j;
 }
 
 /** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    if (isEscapedAt(s, j)) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== 42) continue;
     if (s.charCodeAt(j + 1) === 42) {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -1017,7 +1017,9 @@ function pageOf(s) {
     ...s.card,
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    // The toc entries already hold exactly { level, id, html }: hand them over as they are
+    // instead of copying each one into an identical fresh object.
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
@@ -1092,22 +1094,27 @@ export function run(input) {
   // 4. Each body's Markdown, its links resolved to the pages and static files they name.
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
+  // One link environment for the whole case: `curDir`/`curSrc` are set per source before its
+  // render, instead of building a fresh closure per source. Rendering is synchronous, so
+  // nothing else can observe them mid-source.
+  let curDir = '';
+  let curSrc = '';
+  const env = {
+    link: (target) => {
+      if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+      const hash = target.indexOf('#');
+      const rel = hash === -1 ? target : target.slice(0, hash);
+      const frag = hash === -1 ? '' : target.slice(hash);
+      const path = rel === '' ? null : resolvePath(curDir, rel);
+      if (path !== null && bySource.has(path)) return `${bySource.get(path)}${frag}`;
+      if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
+      broken.add(`broken-link ${curSrc} -> ${target}`);
+      return target;
+    },
+  };
   for (const s of sources) {
-    const dir = dirOf(s.path);
-    const srcPath = s.path;
-    const env = {
-      link: (target) => {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) return `${bySource.get(path)}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
-        broken.add(`broken-link ${srcPath} -> ${target}`);
-        return target;
-      },
-    };
+    curDir = dirOf(s.path);
+    curSrc = s.path;
     const md = renderMarkdown(s.body, env);
     s.html = md.html;
     s.toc = md.toc;
@@ -1169,12 +1176,17 @@ export function run(input) {
   const recent = posts.slice(0, input.site.recent).map((p) => p.card);
   const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
   const cx = { base: baseScope, constant: computeConstantReads(templates), cache: new Map() };
+  // One output array and one top scope, reused by every render call: renders run one at a
+  // time and synchronously, so no call can observe another's pieces or bindings.
+  const renderOut = [];
+  const renderScope = { vars: null, parent: baseScope };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
-    const out = [];
-    renderNodes(nodes, { vars, parent: baseScope }, templates, 0, out, cx);
-    return out.join('');
+    renderOut.length = 0;
+    renderScope.vars = vars;
+    renderNodes(nodes, renderScope, templates, 0, renderOut, cx);
+    return renderOut.join('');
   };
   let pageCount = 0;
   for (const s of sources) {

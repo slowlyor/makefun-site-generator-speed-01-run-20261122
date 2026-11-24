@@ -9,7 +9,11 @@ import { setFlagsFromString } from 'node:v8';
 
 // V8's incremental marking off, set before solve.js is imported so all of its work runs under it (the rules: the house
 // baseline runs with --no-incremental-marking, and an entry may tune V8's flags too).
-setFlagsFromString('--no-incremental-marking');
+// --no-opt: this entry runs once per fresh process, so the optimising compiler's build cost far exceeds what it saves
+// within that one pass; the baseline compiler is faster end to end (measured ~26% faster locally). --single-threaded:
+// the heat runs on one CPU, so background compiler/GC threads only contend with the main thread; measured about even
+// locally, never worse, and it fits the one-CPU container. Neither flag changes any output.
+setFlagsFromString('--no-incremental-marking --no-opt --single-threaded');
 
 /** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
